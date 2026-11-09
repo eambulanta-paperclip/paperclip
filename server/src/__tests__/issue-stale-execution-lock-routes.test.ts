@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   authUsers,
   companyMemberships,
@@ -1441,6 +1441,104 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       executionRunId: null,
     });
     expect(res.body.cancelledAt).toBeTruthy();
+  });
+
+  it("lets a board cancellation persist after stopping the staged native run", async () => {
+    const { companyId, agentId, currentRunId } =
+      await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    const stageId = randomUUID();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        runtimeMode: "native",
+        contextSnapshot: { issueId },
+      })
+      .where(eq(heartbeatRuns.id, currentRunId));
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Board cancels live staged native review",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+      assigneeUserId: null,
+      checkoutRunId: currentRunId,
+      executionRunId: currentRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: stageId,
+          type: "approval",
+          participants: [{ type: "agent", agentId }],
+        }],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "approval",
+        currentParticipant: { type: "agent", agentId },
+        returnAssignee: null,
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    });
+
+    const nativeSessionExecutor = await import(
+      "../services/native-runtime/native-session-executor.js"
+    );
+    const cancelNativeSession = vi
+      .spyOn(nativeSessionExecutor, "cancelNativeSession")
+      .mockResolvedValue({
+        dispatched: true,
+        decision: { outcome: "cancelled" } as never,
+        decisionId: randomUUID(),
+        auditId: randomUUID(),
+      });
+    const res = await request(createApp(boardActor(companyId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "cancelled",
+        comment: "Board cancels this live staged review",
+      });
+    cancelNativeSession.mockRestore();
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toMatchObject({
+      status: "cancelled",
+      assigneeAgentId: agentId,
+      executionState: null,
+      checkoutRunId: null,
+      executionRunId: null,
+      unblockDescriptor: null,
+      blockedTransitionAt: null,
+    });
+    expect(res.body.cancelledAt).toBeTruthy();
+
+    const [stoppedRun] = await db
+      .select({
+        status: heartbeatRuns.status,
+        resultJson: heartbeatRuns.resultJson,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, currentRunId));
+    expect(stoppedRun).toMatchObject({
+      status: "cancelled",
+      resultJson: {
+        terminalizationStopConfirmed: true,
+        cancelledByActorType: "user",
+        cancelledByUserId: "board-user",
+      },
+    });
+    expect(stoppedRun?.resultJson?.issueMutationStopId).toEqual(
+      expect.any(String),
+    );
   });
 
   it("restricts admin force-release to board users with company access and writes an audit event", async () => {

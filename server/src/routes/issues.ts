@@ -15270,6 +15270,10 @@ export function issueRoutes(
       // Only this request may finish a mutation that intentionally stops its
       // own run (for example handing work to a signoff reviewer).
       const issueMutationStopId = randomUUID();
+      let privilegedTerminalizationStopReceipt: {
+        runId: string;
+        stopId: string;
+      } | null = null;
       if (req.actor.source !== "mcp_oauth" && assigneeWillChange && existing.assigneeAgentId) {
         await stopRunnerGoalForOwnershipChange({
           companyId: existing.companyId,
@@ -15390,6 +15394,15 @@ export function issueRoutes(
             );
           }
           interruptedRunId = cancelled.id;
+          if (
+            req.actor.type === "board" &&
+            pendingExecutionStageCancellation
+          ) {
+            privilegedTerminalizationStopReceipt = {
+              runId: cancelled.id,
+              stopId: issueMutationStopId,
+            };
+          }
         }
       }
 
@@ -15447,6 +15460,7 @@ export function issueRoutes(
         actorAgentId: actor.agentId ?? null,
         actorRunId: actor.agentId ? actor.runId : null,
         actorRunStopId: actor.agentId && interruptedRunId === actor.runId ? issueMutationStopId : null,
+        privilegedTerminalizationStopReceipt,
         actorUserId: actor.actorType === "user" ? actor.actorId : null,
       };
       const shouldCollectCompletionPublication =

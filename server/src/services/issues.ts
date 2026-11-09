@@ -11214,6 +11214,15 @@ export function issueService(db: Db) {
         /** Server-owned transfer being applied; never accepted from HTTP input. */
         caseHandoffId?: string;
         actorRunStopId?: string | null;
+        /**
+         * Server-owned proof that a privileged board cancellation stopped the
+         * exact native run whose locks appear in the staged-decision snapshot.
+         * Never accepted from HTTP input.
+         */
+        privilegedTerminalizationStopReceipt?: {
+          runId: string;
+          stopId: string;
+        } | null;
         actorUserId?: string | null;
         companyGuard?: string;
         workspaceSelectionActor?: AuthorizationActor;
@@ -11319,6 +11328,7 @@ export function issueService(db: Db) {
         actorRunId,
         caseHandoffId,
         actorRunStopId,
+        privilegedTerminalizationStopReceipt,
         actorUserId,
         companyGuard,
         workspaceSelectionActor,
@@ -11632,6 +11642,55 @@ export function issueService(db: Db) {
           actorRunStopId &&
           actorRun.resultJson?.issueMutationStopId === actorRunStopId,
         );
+        const privilegedStoppedRun =
+          expectedExecutionDecisionSnapshot !== undefined &&
+          issueData.status === "cancelled" &&
+          actorUserId &&
+          privilegedTerminalizationStopReceipt
+            ? await tx
+                .select({
+                  id: heartbeatRuns.id,
+                  status: heartbeatRuns.status,
+                  resultJson: heartbeatRuns.resultJson,
+                  contextSnapshot: heartbeatRuns.contextSnapshot,
+                })
+                .from(heartbeatRuns)
+                .where(
+                  and(
+                    eq(
+                      heartbeatRuns.id,
+                      privilegedTerminalizationStopReceipt.runId,
+                    ),
+                    eq(heartbeatRuns.companyId, receiptExisting.companyId),
+                  ),
+                )
+                .for("share")
+                .then((rows: Array<{
+                  id: string;
+                  status: string;
+                  resultJson: Record<string, unknown> | null;
+                  contextSnapshot: Record<string, unknown> | null;
+                }>) => rows[0] ?? null)
+            : null;
+        const privilegedRunStoppedForThisMutation = Boolean(
+          privilegedStoppedRun?.status === "cancelled" &&
+          privilegedStoppedRun.id ===
+            privilegedTerminalizationStopReceipt?.runId &&
+          privilegedStoppedRun.resultJson?.issueMutationStopId ===
+            privilegedTerminalizationStopReceipt?.stopId &&
+          privilegedStoppedRun.resultJson?.terminalizationStopConfirmed ===
+            true &&
+          privilegedStoppedRun.resultJson?.cancelledByActorType === "user" &&
+          privilegedStoppedRun.resultJson?.cancelledByUserId === actorUserId &&
+          privilegedStoppedRun.contextSnapshot?.issueId === receiptExisting.id,
+        );
+        const statusMatchesExecutionSnapshot =
+          receiptExisting.status === expectedExecutionDecisionSnapshot?.status ||
+          Boolean(
+            privilegedRunStoppedForThisMutation &&
+            expectedExecutionDecisionSnapshot?.status === "in_review" &&
+            receiptExisting.status === "blocked",
+          );
         const executionLockMatchesSnapshot = (
           actual: string | null,
           expected: string | null,
@@ -11639,10 +11698,14 @@ export function issueService(db: Db) {
           actorStoppedForThisMutation &&
           expected === actorRunId &&
           actual === null,
+        ) || Boolean(
+          privilegedRunStoppedForThisMutation &&
+          expected === privilegedTerminalizationStopReceipt?.runId &&
+          actual === null,
         );
         if (
           expectedExecutionDecisionSnapshot !== undefined &&
-          (receiptExisting.status !== expectedExecutionDecisionSnapshot.status ||
+          (!statusMatchesExecutionSnapshot ||
             receiptExisting.assigneeAgentId !==
               expectedExecutionDecisionSnapshot.assigneeAgentId ||
             receiptExisting.assigneeUserId !==
@@ -11668,6 +11731,19 @@ export function issueService(db: Db) {
             "The execution stage changed before this decision could be saved. Read the task again before deciding.",
             { code: "execution_stage_changed" },
           );
+        }
+        if (
+          privilegedRunStoppedForThisMutation &&
+          receiptExisting.status === "blocked" &&
+          issueData.status === "cancelled"
+        ) {
+          // Native Stop can conservatively block the issue before this board
+          // request obtains the issue row lock. The exact Stop receipt above
+          // proves that this request caused that intermediate state, so finish
+          // the requested cancellation without retaining blocked-only fields.
+          patch.unblockDescriptor = null;
+          patch.blockedTransitionAt = null;
+          patch.blockedOwnerNotifiedAt = null;
         }
         if (issueData.executionPolicy !== undefined) assertQualityReviewPolicyMutation({ previousPolicy: receiptExisting.executionPolicy, nextPolicy: issueData.executionPolicy, actorAgentId, actorUserId });
         if ((patch.status ?? receiptExisting.status) === "done" &&
